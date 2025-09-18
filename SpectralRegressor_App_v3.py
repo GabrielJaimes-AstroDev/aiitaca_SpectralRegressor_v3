@@ -12,11 +12,11 @@ from io import BytesIO
 import zipfile
 import base64
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-from sklearn.svm import SVR
-from sklearn.gaussian_process import GaussianProcessRegressor
 import gc
 from glob import glob
 import plotly.graph_objects as go
+import lightgbm as lgb
+import xgboost as xgb
 
 
 # Set global font settings
@@ -117,19 +117,6 @@ if 'models_loaded' in st.session_state and st.session_state['models_loaded']:
         if param in models['all_models']:
             model_count = len(models['all_models'][param])
             st.write(f"{param}: {model_count} model(s) loaded")
-    st.subheader("📊 PCA Variance Analysis")
-    pca_fig = create_pca_variance_plot(models['ipca'])
-    st.pyplot(pca_fig)
-
-    buf = BytesIO()
-    pca_fig.savefig(buf, format="png", dpi=300, bbox_inches='tight')
-    buf.seek(0)
-    st.download_button(
-        label="📥 Download PCA variance plot",
-        data=buf,
-        file_name="pca_variance_analysis.png",
-        mime="image/png"
-    )
 
 # Function to load models (with caching for better performance)
 @st.cache_resource
@@ -157,9 +144,9 @@ def load_models_from_zip(zip_file):
                 if os.path.exists(scaler_path):
                     models['param_scalers'][param] = joblib.load(scaler_path)
             
-            # Load trained models with detailed debugging
+            # Load trained models
             models['all_models'] = {}
-            model_types = ['randomforest', 'gradientboosting', 'svr', 'gaussianprocess']
+            model_types = ['randomforest', 'gradientboosting', 'lightgbm', 'xgboost']
             
             for param in param_names:
                 param_models = {}
@@ -168,74 +155,10 @@ def load_models_from_zip(zip_file):
                     if os.path.exists(model_path):
                         try:
                             model = joblib.load(model_path)
-                            
-                            # DEBUG: Check what type of object was loaded
-                            model_type_loaded = type(model).__name__
-                            
-                            # SPECIAL FIX FOR GRADIENTBOOSTING MODELS
-                            # Some GradientBoosting models might have their estimators_ attribute corrupted
-                            if (model_type == 'gradientboosting' and 
-                                model_type_loaded == 'GradientBoostingRegressor' and
-                                hasattr(model, 'estimators_') and
-                                len(model.estimators_) > 0):
-                                
-                                # Check if estimators are numpy arrays (new scikit-learn version)
-                                if isinstance(model.estimators_[0][0], np.ndarray):
-                                    # This is the new format - we can use the model directly
-                                    param_models[model_type.capitalize()] = model
-                                    st.success(f"GradientBoosting model for {param} loaded (new format)")
-                                elif hasattr(model.estimators_[0][0], 'predict'):
-                                    # This is a valid GradientBoosting model (old format)
-                                    param_models[model_type.capitalize()] = model
-                                else:
-                                    st.warning(f"GradientBoosting model for {param} has unknown estimator format")
-                                    # Try to use it anyway
-                                    param_models[model_type.capitalize()] = model
-                                
-                            elif (model_type == 'gradientboosting' and 
-                                  model_type_loaded == 'GradientBoostingRegressor'):
-                                # This GradientBoosting model might be corrupted
-                                st.warning(f"GradientBoosting model for {param} might be corrupted")
-                                # Try to check if we can fix it by accessing the underlying estimators
-                                try:
-                                    # Test if we can actually use the model
-                                    test_input = np.zeros((1, models['ipca'].n_components_))
-                                    test_pred = model.predict(test_input)
-                                    # If we get here, the model might work despite the warning
-                                    param_models[model_type.capitalize()] = model
-                                    st.success(f"GradientBoosting model for {param} loaded despite warnings")
-                                except:
-                                    st.error(f"GradientBoosting model for {param} is corrupted and cannot be used")
-                                    continue
-                                
-                            # Check if the loaded object is actually a model
-                            elif hasattr(model, 'predict') or (hasattr(model, '__class__') and 'gaussian_process' in str(model.__class__)):
-                                param_models[model_type.capitalize()] = model
-                            else:
-                                st.warning(f"File {param}_{model_type}.save exists but doesn't contain a valid model object")
+                            param_models[model_type.capitalize()] = model
                         except Exception as e:
                             st.warning(f"Error loading {param}_{model_type}.save: {str(e)}")
                 models['all_models'][param] = param_models
-                
-            # Load training statistics
-            models['training_stats'] = {}
-            models['training_errors'] = {}
-            for param in param_names:
-                # Statistics
-                stats_file = os.path.join(temp_dir, f"training_stats_{param}.npy")
-                if os.path.exists(stats_file):
-                    try:
-                        models['training_stats'][param] = np.load(stats_file, allow_pickle=True).item()
-                    except Exception as e:
-                        st.warning(f"Error loading training stats for {param}: {e}")
-                
-                # Errors
-                errors_file = os.path.join(temp_dir, f"training_errors_{param}.npy")
-                if os.path.exists(errors_file):
-                    try:
-                        models['training_errors'][param] = np.load(errors_file, allow_pickle=True).item()
-                    except Exception as e:
-                        st.warning(f"Error loading training errors for {param}: {e}")
                     
             return models, "✓ Models loaded successfully"
             
@@ -301,7 +224,7 @@ def create_pca_variance_plot(ipca_model):
 def create_model_performance_plots(models, selected_models, filter_name):
     """Create True Value vs Predicted Value plots for each model type"""
     param_names = ['logn', 'tex', 'velo', 'fwhm']
-    model_types = ['Randomforest', 'Gradientboosting', 'Svr', 'Gaussianprocess']
+    model_types = ['Randomforest', 'Gradientboosting', 'Lightgbm', 'Xgboost']
     param_colors = {
         'logn': '#1f77b4',  # Blue
         'tex': '#ff7f0e',   # Orange
@@ -461,71 +384,49 @@ def process_spectrum(spectrum_file, models, target_length=64607):
                         st.warning(f"Skipping {model_name} for {param}: no predict method")
                         continue
                         
-                    if model_name.lower() == 'gaussianprocess':
-                        # Gaussian Process provides native uncertainty
-                        y_pred, y_std = model.predict(X_pca, return_std=True)
-                        y_pred_orig = models['param_scalers'][param].inverse_transform(y_pred.reshape(-1, 1)).flatten()
-                        y_std_orig = y_std * models['param_scalers'][param].scale_
-                        
-                        param_predictions[model_name] = y_pred_orig[0]
-                        param_uncertainties[model_name] = y_std_orig[0]
-                        
-                    else:
-                        
-                        y_pred = model.predict(X_pca)
-                        y_pred_orig = models['param_scalers'][param].inverse_transform(y_pred.reshape(-1, 1)).flatten()
-                        
-                        # Estimate uncertainty based on model type
-                        if hasattr(model, 'estimators_') and len(model.estimators_) > 0:
-
-                            try:
-                                if hasattr(model, 'predict_quantiles'):
-                                    # For GradientBoosting
-                                    quantiles = model.predict_quantiles(X_pca, quantiles=[0.16, 0.84])
-                                    uncertainty = (quantiles[0][1] - quantiles[0][0]) / 2
-                                elif hasattr(model, 'estimators_'):
-                                    individual_preds = []
-                                    for estimator in model.estimators_:
-                                        if hasattr(estimator, 'predict'):
-                                            pred = estimator.predict(X_pca)
-                                            pred_orig = models['param_scalers'][param].inverse_transform(pred.reshape(-1, 1)).flatten()[0]
-                                            individual_preds.append(pred_orig)
-                                    
-                                    if individual_preds:
-                                        uncertainty = np.std(individual_preds)
-                                    else:
-                                        # Fallback if we can't get individual predictions
-                                        uncertainty = np.nan
-                                else:
-                                    uncertainty = np.nan
-                            except Exception as e:
-                                st.warning(f"Error in uncertainty estimation for {model_name}: {e}")
-                                uncertainty = np.nan
-                                
-                        elif hasattr(model, 'staged_predict'):
-                            # For Gradient Boosting, use staged predictions for uncertainty
-                            try:
-                                staged_preds = list(model.staged_predict(X_pca))
-                                staged_preds_orig = [models['param_scalers'][param].inverse_transform(pred.reshape(-1, 1)).flatten()[0] 
-                                                   for pred in staged_preds]
-                                # Use std of later stage predictions (after convergence)
-                                n_stages = len(staged_preds_orig)
-                                if n_stages > 10:
-                                    uncertainty = np.std(staged_preds_orig[-10:])
-                                else:
-                                    uncertainty = np.std(staged_preds_orig)
-                            except Exception as e:
-                                st.warning(f"Error in staged prediction for {model_name}: {e}")
-                                uncertainty = np.nan
-                        else:
-
-                            if param in models.get('training_errors', {}) and model_name in models['training_errors'][param]:
-                                uncertainty = models['training_errors'][param][model_name]
+                    y_pred = model.predict(X_pca)
+                    y_pred_orig = models['param_scalers'][param].inverse_transform(y_pred.reshape(-1, 1)).flatten()
+                    
+                    # Estimate uncertainty based on model type
+                    uncertainty = np.nan
+                    
+                    if hasattr(model, 'estimators_') and len(model.estimators_) > 0:
+                        # For ensemble models (Random Forest, Gradient Boosting)
+                        try:
+                            individual_preds = []
+                            for estimator in model.estimators_:
+                                if hasattr(estimator, 'predict'):
+                                    pred = estimator.predict(X_pca)
+                                    pred_orig = models['param_scalers'][param].inverse_transform(pred.reshape(-1, 1)).flatten()[0]
+                                    individual_preds.append(pred_orig)
+                            
+                            if individual_preds:
+                                uncertainty = np.std(individual_preds)
+                        except Exception as e:
+                            st.warning(f"Error in uncertainty estimation for {model_name}: {e}")
+                    
+                    elif hasattr(model, 'staged_predict'):
+                        # For Gradient Boosting, use staged predictions for uncertainty
+                        try:
+                            staged_preds = list(model.staged_predict(X_pca))
+                            staged_preds_orig = [models['param_scalers'][param].inverse_transform(pred.reshape(-1, 1)).flatten()[0] 
+                                               for pred in staged_preds]
+                            # Use std of later stage predictions (after convergence)
+                            n_stages = len(staged_preds_orig)
+                            if n_stages > 10:
+                                uncertainty = np.std(staged_preds_orig[-10:])
                             else:
-                                uncertainty = np.nan 
-                        
-                        param_predictions[model_name] = y_pred_orig[0]
-                        param_uncertainties[model_name] = uncertainty
+                                uncertainty = np.std(staged_preds_orig)
+                        except Exception as e:
+                            st.warning(f"Error in staged prediction for {model_name}: {e}")
+                    
+                    # For LightGBM and XGBoost, use a default uncertainty
+                    elif model_name in ['Lightgbm', 'Xgboost']:
+                        # Use a percentage-based uncertainty
+                        uncertainty = abs(y_pred_orig[0]) * 0.05  # 5% uncertainty
+                    
+                    param_predictions[model_name] = y_pred_orig[0]
+                    param_uncertainties[model_name] = uncertainty
                         
                 except Exception as e:
                     st.error(f"Error predicting with {model_name} for {param}: {e}")
@@ -550,7 +451,7 @@ def process_spectrum(spectrum_file, models, target_length=64607):
         st.error(f"Error processing the spectrum: {e}")
         return None
 
-def create_comparison_plot(predictions, uncertainties, param, label, training_stats, spectrum_name, selected_models):
+def create_comparison_plot(predictions, uncertainties, param, label, spectrum_name, selected_models):
     """Create comparison plot for a parameter"""
     fig, ax = plt.subplots(figsize=(10, 8))
 
@@ -685,9 +586,9 @@ def create_summary_plot(predictions, uncertainties, param_names, param_labels, s
     axes = axes.flatten()
     model_colors = {
         'Randomforest':'blue',  # Azul
-        'Gradientboosting': 'green',  # Naranja
-        'Svr': 'orange',  # Verde
-        'Gaussianprocess': 'purple'  # Rojo
+        'Gradientboosting': 'green',  # Verde
+        'Lightgbm': 'orange',  # Naranja
+        'Xgboost': 'purple'  # Púrpura
     }
     
     for idx, (param, label) in enumerate(zip(param_names, param_labels)):
@@ -893,7 +794,7 @@ def generate_filtered_spectra(spectrum_file, filters_dir, selected_velocity, sel
 
 def main():
     if 'selected_models' not in st.session_state:
-        st.session_state.selected_models = ['Randomforest', 'Gradientboosting', 'Svr', 'Gaussianprocess']
+        st.session_state.selected_models = ['Randomforest', 'Gradientboosting', 'Lightgbm', 'Xgboost']
     
     if 'expected_values' not in st.session_state:
         st.session_state.expected_values = {
@@ -995,7 +896,7 @@ def main():
                                 selected_velocity, 
                                 selected_fwhm, 
                                 selected_sigma,
-                                allow_negative=st.session_state.consider_absorption  # <-- Añade este argumento
+                                allow_negative=st.session_state.consider_absorption
                             )
                             
                             os.unlink(tmp_spectrum_path)
@@ -1015,18 +916,18 @@ def main():
 
         rf_selected = st.checkbox("Random Forest", value=True, key='rf_checkbox')
         gb_selected = st.checkbox("Gradient Boosting", value=True, key='gb_checkbox')
-        svr_selected = st.checkbox("Support Vector Regression", value=True, key='svr_checkbox')
-        gp_selected = st.checkbox("Gaussian Process", value=True, key='gp_checkbox')
+        lgb_selected = st.checkbox("LightGBM", value=True, key='lgb_checkbox')
+        xgb_selected = st.checkbox("XGBoost", value=True, key='xgb_checkbox')
         
         selected_models = []
         if rf_selected:
             selected_models.append('Randomforest')
         if gb_selected:
             selected_models.append('Gradientboosting')
-        if svr_selected:
-            selected_models.append('Svr')
-        if gp_selected:
-            selected_models.append('Gaussianprocess')
+        if lgb_selected:
+            selected_models.append('Lightgbm')
+        if xgb_selected:
+            selected_models.append('Xgboost')
             
         st.session_state.selected_models = selected_models
         
@@ -1095,7 +996,8 @@ def main():
                     return
                 
                 st.success(message)
-
+                st.session_state.models_obj = models
+                st.session_state.models_loaded = True
 
             # Only process the selected filtered spectrum
             spectrum_path = st.session_state.filtered_spectra[selected_filter]
@@ -1192,7 +1094,7 @@ def main():
                         xaxis_title="PCA Component",
                         yaxis_title="Value",
                         template="simple_white",
-                        font=dict(family="Times New Roman", size=16, color="black"),
+                        font=dict(family="Times New Roman', size=16, color="black"),
                         height=400,
                         xaxis=dict(
                             showgrid=True,
@@ -1295,8 +1197,7 @@ def main():
                                     results['uncertainties'], 
                                     param, 
                                     label, 
-                                    models.get('training_stats', {}),
-                                    selected_filter,  # <-- use selected_filter here
+                                    selected_filter,
                                     st.session_state.selected_models
                                 )
                                 st.pyplot(fig)
@@ -1324,7 +1225,7 @@ def main():
                             results['uncertainties'],
                             results['param_names'],
                             results['param_labels'],
-                            selected_filter,  # <-- use selected_filter here
+                            selected_filter,
                             st.session_state.selected_models
                         )
                         st.pyplot(fig)
