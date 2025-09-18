@@ -1094,7 +1094,7 @@ def main():
                         xaxis_title="PCA Component",
                         yaxis_title="Value",
                         template="simple_white",
-                        font=dict(family="Times New Roman', size=16, color="black"),
+                        font=dict(family="Times New Roman", size=16, color="black"),
                         height=400,
                         xaxis=dict(
                             showgrid=True,
